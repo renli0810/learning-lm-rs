@@ -1,3 +1,8 @@
+use std::{
+    cmp::{max, min},
+    vec,
+};
+
 use crate::tensor::Tensor;
 
 // get (row) vectors from a 2D table given a list of indices
@@ -71,7 +76,28 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    let xshape = x.shape();
+    let xdata = x.data();
+    let ydata = unsafe { y.data_mut() };
+    let wdata = w.data();
+    let wshape = w.shape();
+
+    let n = xshape[xshape.len() - 1];
+    assert!(n == wshape[0]);
+    let outersize: usize = xshape.iter().take(xshape.len() - 1).product();
+    for i in 0..outersize {
+        let offset = i * n;
+        let sum_x: f32 = xdata[offset..offset + n].iter().map(|&i| i * i).sum();
+        let rms = (sum_x / n as f32 + epsilon).sqrt();
+        for (j, (&xval, &wval)) in xdata[offset..offset + n]
+            .iter()
+            .zip(wdata[0..n].iter())
+            .enumerate()
+        {
+            ydata[offset + j] = wval * xval / rms;
+        }
+    }
+    // todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
 }
 
 // y = silu(x) * y
@@ -83,16 +109,162 @@ pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
     let _y = unsafe { y.data_mut() };
     let _x = x.data();
 
-    for i in 0..len {
-        _y[i] = _y[i] * _x[i] / (1.0+(-_x[i]).exp()); 
+    for (i, &xval) in _x[0..len].iter().enumerate() {
+        _y[i] = _y[i] * xval / (1.0 + (-xval).exp());
     }
     // todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
 }
 
+fn shape_extend(shape: &[usize], target_len: usize) -> Vec<usize> {
+    println!("shape:{:?},target_len:{}", shape, target_len);
+    let mut res = vec![1; target_len - shape.len()];
+    res.extend(shape);
+    res
+}
+fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
+    let alen = a.len();
+    let blen = b.len();
+    assert!(alen == blen);
+
+    let mut res = Vec::with_capacity(alen);
+    for (&adim, &bdim) in a.iter().zip(b.iter()) {
+        if adim == bdim {
+            res.push(adim);
+        } else if adim == 1 {
+            res.push(bdim);
+        } else if bdim == 1 {
+            res.push(adim);
+        } else {
+            return None;
+        }
+    }
+    Some(res)
+}
+fn stride_compute(veccompute: &[usize], row: usize, col: usize) -> Vec<usize> {
+    let mut strides = Vec::with_capacity(veccompute.len());
+    let mut product = 1;
+    for &dim in veccompute.iter().rev() {
+        strides.push(product * row * col);
+        product *= dim;
+    }
+    strides.reverse();
+    strides
+}
+fn stride_compute_all(veccompute: &[usize]) -> Vec<usize> {
+    let mut stride = vec![1; veccompute.len()];
+    if veccompute.len() == 0 {
+        return stride;
+    }
+    for i in (0..veccompute.len() - 1).rev() {
+        stride[i] = stride[i + 1] * veccompute[i + 1];
+    }
+    return stride;
+}
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    let ashape = a.shape().clone();
+    let adims = ashape.len();
+    assert!(adims >= 2);
+    let m = ashape[adims - 2];
+    let p_a = ashape[adims - 1];
+
+    let bshape = b.shape().clone();
+    let bdims = bshape.len();
+    assert!(bdims >= 2);
+    let n = bshape[bdims - 2];
+    let p_b = bshape[bdims - 1];
+
+    assert!(p_a == p_b);
+
+    let maxdim = max(adims, bdims);
+    let ashape_extend = shape_extend(&ashape[..adims - 2], maxdim - 2);
+    let bshape_extend = shape_extend(&bshape[..bdims - 2], maxdim - 2);
+
+    println!(
+        "ashape_extend:{:?}bshape_extend:{:?}",
+        ashape_extend, bshape_extend
+    );
+    let cshape_broadcast =
+        broadcast_shape(&ashape_extend, &bshape_extend).expect("Broadcast Error!");
+
+    let ashape_stride = stride_compute(&ashape_extend, m, p_a);
+    let ashape_stride_broadcast: Vec<usize> = ashape_extend
+        .iter()
+        .zip(cshape_broadcast.iter())
+        .zip(ashape_stride)
+        .map(|((&adim, &cdim), stride)| if adim == 1 && cdim != 1 { 0 } else { stride })
+        .collect();
+
+    let bshape_stride = stride_compute(&bshape_extend, p_b, n);
+    let bshape_stride_broadcast: Vec<usize> = bshape_extend
+        .iter()
+        .zip(cshape_broadcast.iter())
+        .zip(bshape_stride)
+        .map(|((&bdim, &cdim), stride)| if bdim == 1 && cdim != 1 { 0 } else { stride })
+        .collect();
+
+    let mut cshape = cshape_broadcast.clone();
+    cshape.push(m);
+    cshape.push(n);
+    let cshape_stride = stride_compute_all(&cshape);
+
+    let _c = unsafe { c.data_mut() };
+    let _a = a.data();
+    let _b = b.data();
+
+    let mut done_index = vec![0; cshape_broadcast.len()];
+    loop {
+        let aoffset: usize = done_index
+            .iter()
+            .zip(ashape_stride_broadcast.iter())
+            .map(|(&i, &s)| i * s)
+            .sum();
+        let boffset: usize = done_index
+            .iter()
+            .zip(bshape_stride_broadcast.iter())
+            .map(|(&i, &s)| i * s)
+            .sum();
+        let coffset: usize = done_index
+            .iter()
+            .zip(&cshape_stride[..cshape_broadcast.len()])
+            .map(|(&i, &s)| i * s)
+            .sum();
+
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..p_a {
+                    let a_index = aoffset + i * p_a + k;
+                    let b_index = boffset + j * p_a + k;
+                    sum += _a[a_index] * _b[b_index] * alpha;
+
+                    //println!("a_index:{} a_data:{} bindex:{} b_data:{}",a_index,_a[a_index],b_index,_b[b_index]);
+                }
+                let c_index = coffset + i * n + j;
+                _c[c_index] = sum + beta * _c[c_index];
+                //println!("coffset:{} i:{} j:{} c_index:{} _c[c_index]:{}",coffset,i,j,c_index,_c[c_index]);
+            }
+        }
+
+        let mut flag = true;
+        for i in (0..cshape_broadcast.len()).rev() {
+            if flag {
+                done_index[i] += 1;
+                if done_index[i] >= cshape_broadcast[i] {
+                    done_index[i] = 0;
+                    flag = true;
+                } else {
+                    flag = false;
+                }
+            }
+        }
+        if flag {
+            break;
+        }
+    }
+    c.reshape(&cshape);
+    // todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
 }
 
 // Dot product of two tensors (treated as vectors)
@@ -212,3 +384,37 @@ fn test_matmul_transb() {
         1e-3
     ));
 }
+
+// #[test]
+// fn test_matmul_other() {
+//     let mut c = Tensor::<f32>::new(
+//         vec![
+//             1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16., 17., 18., 19.,
+//             20., 21., 22., 23., 24., 25., 26., 27., 28., 29., 30., 31., 32.,
+//         ],
+//         &vec![4, 2, 2, 2],
+//     );
+//     let a = Tensor::<f32>::new(
+//         vec![
+//             1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16., 17., 18., 19.,
+//             20., 21., 22., 23., 24.,
+//         ],
+//         &vec![4, 1, 2, 3],
+//     );
+//     let b = Tensor::<f32>::new(
+//         vec![1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+//         &vec![2, 2, 3],
+//     );
+//     matmul_transb(&mut c, 0.0, &a, &b, 1.);
+//     assert!(c.close_to(
+//         &Tensor::<f32>::new(
+//             vec![
+//                 14., 32., 32., 77., 50., 68., 122., 167., 50., 122., 68., 167., 194., 266., 266.,
+//                 365., 86., 212., 104., 257., 338., 464., 410., 563., 122., 302., 140., 347., 482.,
+//                 662., 554., 761.
+//             ],
+//             &vec![4, 2, 2, 2]
+//         ),
+//         1e-3
+//     ));
+// }
